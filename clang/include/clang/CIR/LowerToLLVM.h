@@ -33,6 +33,15 @@ std::unique_ptr<llvm::Module> lowerDirectlyFromCIRToLLVMIR(
     mlir::ModuleOp theModule, llvm::LLVMContext &llvmCtx,
     bool disableVerifier = false, bool disableCCLowering = false,
     bool disableDebugInfo = false);
+
+/// Same as \c lowerDirectlyFromCIRToLLVMIR but returns nullptr on failure
+/// instead of aborting the process.
+///
+/// used in cir-tac/src/CirToLlvmIr.cpp
+std::unique_ptr<llvm::Module> tryLowerDirectlyFromCIRToLLVMIR(
+    mlir::ModuleOp theModule, llvm::LLVMContext &llvmCtx,
+    bool disableVerifier = false, bool disableCCLowering = false,
+    bool disableDebugInfo = false);
 }
 
 // Lower directly from pristine CIR to LLVMIR.

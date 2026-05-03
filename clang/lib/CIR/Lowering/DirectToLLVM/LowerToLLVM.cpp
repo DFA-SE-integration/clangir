@@ -4449,5 +4449,42 @@ lowerDirectlyFromCIRToLLVMIR(mlir::ModuleOp theModule, LLVMContext &llvmCtx,
 
   return llvmModule;
 }
+
+std::unique_ptr<llvm::Module>
+tryLowerDirectlyFromCIRToLLVMIR(mlir::ModuleOp theModule,
+                               llvm::LLVMContext &llvmCtx,
+                               bool disableVerifier, bool disableCCLowering,
+                               bool disableDebugInfo) {
+  llvm::TimeTraceScope scope("try lower from CIR to LLVM directly");
+
+  mlir::MLIRContext *mlirCtx = theModule.getContext();
+  mlir::PassManager pm(mlirCtx);
+  populateCIRToLLVMPasses(pm, !disableCCLowering);
+
+  if (!disableDebugInfo) {
+    pm.addPass(mlir::LLVM::createDIScopeForLLVMFuncOpPass());
+  }
+  pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+
+  pm.enableVerifier(!disableVerifier);
+  (void)mlir::applyPassManagerCLOptions(pm);
+
+  if (mlir::failed(pm.run(theModule)))
+    return nullptr;
+
+  if (theModule.verify().failed())
+    return nullptr;
+
+  mlir::registerBuiltinDialectTranslation(*mlirCtx);
+  mlir::registerLLVMDialectTranslation(*mlirCtx);
+  mlir::registerOpenMPDialectTranslation(*mlirCtx);
+  registerCIRDialectTranslation(*mlirCtx);
+
+  llvm::TimeTraceScope __scope("translateModuleToLLVMIR");
+
+  auto ModuleName = theModule.getName();
+  return mlir::translateModuleToLLVMIR(
+      theModule, llvmCtx, ModuleName ? *ModuleName : "CIRToLLVMModule");
+}
 } // namespace direct
 } // namespace cir

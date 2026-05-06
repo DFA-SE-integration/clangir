@@ -167,6 +167,36 @@ void getOrCreateLLVMFuncOp(mlir::ConversionPatternRewriter &rewriter,
 }
 
 static constexpr StringRef llvmMetadataSectionName = "llvm.metadata";
+/// Opaque cir-tac operation id (matches serialized `MLIROpID`). Stamped on CIR
+/// ops before lowering; propagated to LLVM dialect ops and emitted as
+/// `!seqra.op` LLVM IR metadata for Sea-dsa.
+static constexpr StringRef seqraOpIdAttrName = "cir.seqra.op_id";
+
+/// Read `cir.seqra.op_id` when present (cir-tac / tooling workflows).
+static std::optional<uint64_t> getSeqraOpIdForOp(mlir::Operation *tgt) {
+  if (!tgt)
+    return std::nullopt;
+  if (auto attr = tgt->getAttrOfType<mlir::IntegerAttr>(seqraOpIdAttrName))
+    return static_cast<uint64_t>(attr.getInt());
+  return std::nullopt;
+}
+
+/// Propagate `cir.seqra.op_id` from the source CIR op onto \p dstLlvmOp.
+static void attachSeqraOpId(mlir::Operation *dstLlvmOp,
+                            std::optional<uint64_t> opId,
+                            mlir::ConversionPatternRewriter &rewriter) {
+  if (!opId || !dstLlvmOp || dstLlvmOp->getNumResults() == 0)
+    return;
+  rewriter.modifyOpInPlace(dstLlvmOp, [&] {
+    dstLlvmOp->setAttr(seqraOpIdAttrName,
+                       rewriter.getI64IntegerAttr(*opId));
+  });
+}
+
+static std::optional<uint64_t>
+captureSeqraOpIdForLowering(mlir::Operation *cirOp) {
+  return getSeqraOpIdForOp(cirOp);
+}
 
 // Create a string global for annotation related string.
 mlir::LLVM::GlobalOp
@@ -859,8 +889,10 @@ mlir::LogicalResult CIRToLLVMPtrStrideOpLowering::matchAndRewrite(
     }
   }
 
-  rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
+  auto seqra = captureSeqraOpIdForLowering(ptrStrideOp.getOperation());
+  auto gep = rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
       ptrStrideOp, resultTy, elementTy, adaptor.getBase(), index);
+  attachSeqraOpId(gep.getOperation(), seqra, rewriter);
   return mlir::success();
 }
 
@@ -875,14 +907,18 @@ mlir::LogicalResult CIRToLLVMBaseClassAddrOpLowering::matchAndRewrite(
   mlir::Type byteType = mlir::IntegerType::get(resultType.getContext(), 8,
                                                mlir::IntegerType::Signless);
   if (adaptor.getOffset().getZExtValue() == 0) {
-    rewriter.replaceOpWithNewOp<mlir::LLVM::BitcastOp>(
+    auto seqra = captureSeqraOpIdForLowering(baseClassOp.getOperation());
+    auto bitcastOp = rewriter.replaceOpWithNewOp<mlir::LLVM::BitcastOp>(
         baseClassOp, resultType, adaptor.getDerivedAddr());
+    attachSeqraOpId(bitcastOp.getOperation(), seqra, rewriter);
     return mlir::success();
   }
 
   if (baseClassOp.getAssumeNotNull()) {
-    rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
+    auto seqra = captureSeqraOpIdForLowering(baseClassOp.getOperation());
+    auto gepOp = rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
         baseClassOp, resultType, byteType, derivedAddr, offset);
+    attachSeqraOpId(gepOp.getOperation(), seqra, rewriter);
   } else {
     auto loc = baseClassOp.getLoc();
     mlir::Value isNull = rewriter.create<mlir::LLVM::ICmpOp>(
@@ -890,8 +926,10 @@ mlir::LogicalResult CIRToLLVMBaseClassAddrOpLowering::matchAndRewrite(
         rewriter.create<mlir::LLVM::ZeroOp>(loc, derivedAddr.getType()));
     mlir::Value adjusted = rewriter.create<mlir::LLVM::GEPOp>(
         loc, resultType, byteType, derivedAddr, offset);
-    rewriter.replaceOpWithNewOp<mlir::LLVM::SelectOp>(baseClassOp, isNull,
-                                                      derivedAddr, adjusted);
+    auto seqra = captureSeqraOpIdForLowering(baseClassOp.getOperation());
+    auto selOp = rewriter.replaceOpWithNewOp<mlir::LLVM::SelectOp>(
+        baseClassOp, isNull, derivedAddr, adjusted);
+    attachSeqraOpId(selOp.getOperation(), seqra, rewriter);
   }
   return mlir::success();
 }
@@ -907,8 +945,10 @@ mlir::LogicalResult CIRToLLVMDerivedClassAddrOpLowering::matchAndRewrite(
   mlir::Type byteType = mlir::IntegerType::get(resultType.getContext(), 8,
                                                mlir::IntegerType::Signless);
   if (derivedClassOp.getAssumeNotNull()) {
-    rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(derivedClassOp, resultType,
-                                                   byteType, baseAddr, offset);
+    auto seqra = captureSeqraOpIdForLowering(derivedClassOp.getOperation());
+    auto gepOp = rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
+        derivedClassOp, resultType, byteType, baseAddr, offset);
+    attachSeqraOpId(gepOp.getOperation(), seqra, rewriter);
   } else {
     auto loc = derivedClassOp.getLoc();
     mlir::Value isNull = rewriter.create<mlir::LLVM::ICmpOp>(
@@ -916,8 +956,10 @@ mlir::LogicalResult CIRToLLVMDerivedClassAddrOpLowering::matchAndRewrite(
         rewriter.create<mlir::LLVM::ZeroOp>(loc, baseAddr.getType()));
     mlir::Value adjusted = rewriter.create<mlir::LLVM::GEPOp>(
         loc, resultType, byteType, baseAddr, offset);
-    rewriter.replaceOpWithNewOp<mlir::LLVM::SelectOp>(derivedClassOp, isNull,
-                                                      baseAddr, adjusted);
+    auto seqra = captureSeqraOpIdForLowering(derivedClassOp.getOperation());
+    auto selOp = rewriter.replaceOpWithNewOp<mlir::LLVM::SelectOp>(
+        derivedClassOp, isNull, baseAddr, adjusted);
+    attachSeqraOpId(selOp.getOperation(), seqra, rewriter);
   }
   return mlir::success();
 }
@@ -964,8 +1006,10 @@ mlir::LogicalResult CIRToLLVMVTTAddrPointOpLowering::matchAndRewrite(
     offsets.push_back(0);
     offsets.push_back(adaptor.getOffset());
   }
-  rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(op, resultType, eltType,
-                                                 llvmAddr, offsets, true);
+  auto seqraVTT = captureSeqraOpIdForLowering(op.getOperation());
+  auto gepOp = rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
+      op, resultType, eltType, llvmAddr, offsets, true);
+  attachSeqraOpId(gepOp.getOperation(), seqraVTT, rewriter);
   return mlir::success();
 }
 
@@ -1021,8 +1065,10 @@ mlir::LogicalResult CIRToLLVMCastOpLowering::matchAndRewrite(
     auto targetType = convertTy(ptrTy);
     auto elementTy = convertTy(ptrTy.getPointee());
     auto offset = llvm::SmallVector<mlir::LLVM::GEPArg>{0};
-    rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
+    auto seqra = captureSeqraOpIdForLowering(castOp.getOperation());
+    auto gepOp = rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
         castOp, targetType, elementTy, sourceValue, offset);
+    attachSeqraOpId(gepOp.getOperation(), seqra, rewriter);
     break;
   }
   case cir::CastKind::int_to_bool: {
@@ -1077,8 +1123,10 @@ mlir::LogicalResult CIRToLLVMCastOpLowering::matchAndRewrite(
     auto dstTy = mlir::cast<cir::PointerType>(castOp.getType());
     auto llvmSrcVal = adaptor.getOperands().front();
     auto llvmDstTy = getTypeConverter()->convertType(dstTy);
-    rewriter.replaceOpWithNewOp<mlir::LLVM::IntToPtrOp>(castOp, llvmDstTy,
-                                                        llvmSrcVal);
+    auto seqra = captureSeqraOpIdForLowering(castOp.getOperation());
+    auto intToPtr = rewriter.replaceOpWithNewOp<mlir::LLVM::IntToPtrOp>(
+        castOp, llvmDstTy, llvmSrcVal);
+    attachSeqraOpId(intToPtr.getOperation(), seqra, rewriter);
     return mlir::success();
   }
   case cir::CastKind::ptr_to_int: {
@@ -1157,11 +1205,14 @@ mlir::LogicalResult CIRToLLVMCastOpLowering::matchAndRewrite(
     return mlir::success();
   }
   case cir::CastKind::bitcast: {
-    auto dstTy = castOp.getType();
-    auto llvmSrcVal = adaptor.getOperands().front();
-    auto llvmDstTy = getTypeConverter()->convertType(dstTy);
-    rewriter.replaceOpWithNewOp<mlir::LLVM::BitcastOp>(castOp, llvmDstTy,
-                                                       llvmSrcVal);
+    auto dstTyBC = castOp.getType();
+    auto llvmSrcValBC = adaptor.getOperands().front();
+    auto llvmDstTyBC = getTypeConverter()->convertType(dstTyBC);
+    auto seqraBC = captureSeqraOpIdForLowering(castOp.getOperation());
+    auto bitcastOp = rewriter.replaceOpWithNewOp<mlir::LLVM::BitcastOp>(
+        castOp, llvmDstTyBC, llvmSrcValBC);
+    if (mlir::isa<cir::PointerType>(dstTyBC))
+      attachSeqraOpId(bitcastOp.getOperation(), seqraBC, rewriter);
     return mlir::success();
   }
   case cir::CastKind::ptr_to_bool: {
@@ -1179,8 +1230,10 @@ mlir::LogicalResult CIRToLLVMCastOpLowering::matchAndRewrite(
     auto dstTy = castOp.getType();
     auto llvmSrcVal = adaptor.getOperands().front();
     auto llvmDstTy = getTypeConverter()->convertType(dstTy);
-    rewriter.replaceOpWithNewOp<mlir::LLVM::AddrSpaceCastOp>(castOp, llvmDstTy,
-                                                             llvmSrcVal);
+    auto seqra = captureSeqraOpIdForLowering(castOp.getOperation());
+    auto asCast = rewriter.replaceOpWithNewOp<mlir::LLVM::AddrSpaceCastOp>(
+        castOp, llvmDstTy, llvmSrcVal);
+    attachSeqraOpId(asCast.getOperation(), seqra, rewriter);
     break;
   }
   default: {
@@ -1253,15 +1306,23 @@ rewriteToCallOrInvoke(mlir::Operation *op, mlir::ValueRange callOperands,
     llvmFnTy = cast<mlir::LLVM::LLVMFunctionType>(converter->convertType(ftyp));
   }
 
+  // Capture the source CIR call's local index *before* it gets replaced;
+  // attach the resulting attribute to the freshly created llvm op so that
+  // SeqraSeaDSA can find calls that produce a pointer (e.g. malloc/realloc/
+  // operator new and any user-defined factory).
+  auto seqraCall = captureSeqraOpIdForLowering(op);
+
   if (landingPadBlock) {
     auto newOp = rewriter.replaceOpWithNewOp<mlir::LLVM::InvokeOp>(
         op, llvmFnTy, calleeAttr, callOperands, continueBlock,
         mlir::ValueRange{}, landingPadBlock, mlir::ValueRange{});
     newOp.setCConv(cconv);
+    attachSeqraOpId(newOp.getOperation(), seqraCall, rewriter);
   } else {
     auto newOp = rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
         op, llvmFnTy, calleeAttr, callOperands);
     newOp.setCConv(cconv);
+    attachSeqraOpId(newOp.getOperation(), seqraCall, rewriter);
   }
   return mlir::success();
 }
@@ -1349,10 +1410,17 @@ mlir::LogicalResult CIRToLLVMEhInflightOpLowering::matchAndRewrite(
   if (op.getCleanup())
     padOp.setCleanup(true);
 
+  // Capture seqra info for the original cir.eh_inflight op (first result is
+  // the exception pointer slot). The freshly created `extractvalue` for
+  // `slot` becomes the new pointer-producing op in LLVM dialect, so attach
+  // the metadata onto it before `replaceOp` invalidates `op`.
+  auto seqraEh = captureSeqraOpIdForLowering(op.getOperation());
   mlir::Value slot =
       rewriter.create<mlir::LLVM::ExtractValueOp>(loc, padOp, slotIdx);
   mlir::Value selector =
       rewriter.create<mlir::LLVM::ExtractValueOp>(loc, padOp, selectorIdx);
+  if (auto *slotOp = slot.getDefiningOp())
+    attachSeqraOpId(slotOp, seqraEh, rewriter);
 
   rewriter.replaceOp(op, mlir::ValueRange{slot, selector});
 
@@ -1437,8 +1505,11 @@ mlir::LogicalResult CIRToLLVMAllocaOpLowering::matchAndRewrite(
   if (op.getAnnotations())
     annotations = op.getAnnotationsAttr();
 
+  auto seqraAlloca = captureSeqraOpIdForLowering(op.getOperation());
   auto llvmAlloca = rewriter.replaceOpWithNewOp<mlir::LLVM::AllocaOp>(
       op, resultTy, elementTy, size, op.getAlignmentAttr().getInt());
+
+  attachSeqraOpId(llvmAlloca.getOperation(), seqraAlloca, rewriter);
 
   if (annotations && !annotations.empty())
     buildAllocaAnnotations(llvmAlloca, adaptor, rewriter, annotations);
@@ -1480,11 +1551,15 @@ mlir::LogicalResult CIRToLLVMLoadOpLowering::matchAndRewrite(
     alignment = *alignOpt;
   }
 
+  auto seqraLoad = captureSeqraOpIdForLowering(op.getOperation());
   // TODO: nontemporal, invariant, syncscope.
-  rewriter.replaceOpWithNewOp<mlir::LLVM::LoadOp>(
+  mlir::LLVM::LoadOp llvmLoadOp = rewriter.replaceOpWithNewOp<mlir::LLVM::LoadOp>(
       op, llvmTy, adaptor.getAddr(), /* alignment */ alignment,
       op.getIsVolatile(), /* nontemporal */ false,
       /* invariant */ false, /* invariantGroup */ false, ordering);
+  if (mlir::isa<cir::PointerType>(op.getResult().getType()))
+    attachSeqraOpId(llvmLoadOp.getOperation(), seqraLoad, rewriter);
+
   return mlir::LogicalResult::success();
 }
 
@@ -1574,7 +1649,12 @@ mlir::LogicalResult CIRToLLVMConstantOpLowering::matchAndRewrite(
     }
     // Lower GlobalViewAttr to llvm.mlir.addressof
     if (auto gv = mlir::dyn_cast<cir::GlobalViewAttr>(op.getValue())) {
+      // The result is a fresh pointer to a global; tag the producing
+      // LLVM-dialect op so the alias bridge can see this as a pointer source.
+      auto seqra = captureSeqraOpIdForLowering(op.getOperation());
       auto newOp = lowerCirAttrAsValue(op, gv, rewriter, getTypeConverter());
+      if (auto *defOp = newOp.getDefiningOp())
+        attachSeqraOpId(defOp, seqra, rewriter);
       rewriter.replaceOp(op, newOp);
       return mlir::success();
     }
@@ -1980,6 +2060,8 @@ mlir::LogicalResult CIRToLLVMGetGlobalOpLowering::matchAndRewrite(
     return mlir::success();
   }
 
+  mlir::Operation *cirOp = op.getOperation();
+  auto seqraGG = captureSeqraOpIdForLowering(cirOp);
   auto type = getTypeConverter()->convertType(op.getType());
   auto symbol = op.getName();
   mlir::Operation *newop =
@@ -1992,6 +2074,7 @@ mlir::LogicalResult CIRToLLVMGetGlobalOpLowering::matchAndRewrite(
   }
 
   rewriter.replaceOp(op, newop);
+  attachSeqraOpId(newop, seqraGG, rewriter);
   return mlir::success();
 }
 
@@ -2041,9 +2124,11 @@ mlir::LogicalResult CIRToLLVMComplexRealPtrOpLowering::matchAndRewrite(
   auto elementLLVMTy = getTypeConverter()->convertType(operandTy.getPointee());
 
   mlir::LLVM::GEPArg gepIndices[2]{{0}, {0}};
-  rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
+  auto seqra = captureSeqraOpIdForLowering(op.getOperation());
+  auto gepOp = rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
       op, resultLLVMTy, elementLLVMTy, adaptor.getOperand(), gepIndices,
       /*inbounds=*/true);
+  attachSeqraOpId(gepOp.getOperation(), seqra, rewriter);
 
   return mlir::success();
 }
@@ -2056,9 +2141,11 @@ mlir::LogicalResult CIRToLLVMComplexImagPtrOpLowering::matchAndRewrite(
   auto elementLLVMTy = getTypeConverter()->convertType(operandTy.getPointee());
 
   mlir::LLVM::GEPArg gepIndices[2]{{0}, {1}};
-  rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
+  auto seqra = captureSeqraOpIdForLowering(op.getOperation());
+  auto gepOp = rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
       op, resultLLVMTy, elementLLVMTy, adaptor.getOperand(), gepIndices,
       /*inbounds=*/true);
+  attachSeqraOpId(gepOp.getOperation(), seqra, rewriter);
 
   return mlir::success();
 }
@@ -2691,9 +2778,14 @@ mlir::LLVM::CallIntrinsicOp replaceOpWithCallLLVMIntrinsicOp(
     mlir::ConversionPatternRewriter &rewriter, mlir::Operation *op,
     const llvm::Twine &intrinsicName, mlir::Type resultTy,
     mlir::ValueRange operands) {
+  // Capture seqra metadata (if any) before `op` is replaced; intrinsics like
+  // llvm.ptrmask/llvm.invariant.group.barrier/llvm.launder.invariant.group
+  // return a pointer that participates in alias graphs.
+  auto seqra = captureSeqraOpIdForLowering(op);
   auto callIntrinOp = createCallLLVMIntrinsicOp(
       rewriter, op->getLoc(), intrinsicName, resultTy, operands);
   rewriter.replaceOp(op, callIntrinOp.getOperation());
+  attachSeqraOpId(callIntrinOp.getOperation(), seqra, rewriter);
   return callIntrinOp;
 }
 
@@ -2970,9 +3062,13 @@ mlir::LogicalResult CIRToLLVMAtomicXchgLowering::matchAndRewrite(
     mlir::ConversionPatternRewriter &rewriter) const {
   // FIXME: add syncscope.
   auto llvmOrder = getLLVMAtomicOrder(adaptor.getMemOrder());
-  rewriter.replaceOpWithNewOp<mlir::LLVM::AtomicRMWOp>(
+  // The xchg result type matches `val` (AllTypesMatch<["result", "val"]>);
+  // when val is a pointer, the result is a pointer too, so propagate seqra.
+  auto seqra = captureSeqraOpIdForLowering(op.getOperation());
+  auto rmw = rewriter.replaceOpWithNewOp<mlir::LLVM::AtomicRMWOp>(
       op, mlir::LLVM::AtomicBinOp::xchg, adaptor.getPtr(), adaptor.getVal(),
       llvmOrder);
+  attachSeqraOpId(rmw.getOperation(), seqra, rewriter);
   return mlir::success();
 }
 
@@ -3181,8 +3277,12 @@ mlir::LogicalResult CIRToLLVMSelectOpLowering::matchAndRewrite(
   auto llvmCondition = rewriter.create<mlir::LLVM::TruncOp>(
       op.getLoc(), mlir::IntegerType::get(op->getContext(), 1),
       adaptor.getCondition());
-  rewriter.replaceOpWithNewOp<mlir::LLVM::SelectOp>(
+  // The result may be a pointer (cond ? p1 : p2). attachSeqraOpId
+  // is a no-op for non-pointer cir.select.
+  auto seqraSel = captureSeqraOpIdForLowering(op.getOperation());
+  auto newOp = rewriter.replaceOpWithNewOp<mlir::LLVM::SelectOp>(
       op, llvmCondition, adaptor.getTrueValue(), adaptor.getFalseValue());
+  attachSeqraOpId(newOp.getOperation(), seqraSel, rewriter);
 
   return mlir::success();
 }
@@ -3210,15 +3310,19 @@ mlir::LogicalResult CIRToLLVMGetMemberOpLowering::matchAndRewrite(
     // is always zero. The second offset tell us which member it will access.
     llvm::SmallVector<mlir::LLVM::GEPArg, 2> offset{0, op.getIndex()};
     const auto elementTy = getTypeConverter()->convertType(structTy);
-    rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(op, llResTy, elementTy,
-                                                   adaptor.getAddr(), offset);
+    auto seqra = captureSeqraOpIdForLowering(op.getOperation());
+    auto gepOp = rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
+        op, llResTy, elementTy, adaptor.getAddr(), offset);
+    attachSeqraOpId(gepOp.getOperation(), seqra, rewriter);
     return mlir::success();
   }
   case cir::StructType::Union:
     // Union members share the address space, so we just need a bitcast to
     // conform to type-checking.
-    rewriter.replaceOpWithNewOp<mlir::LLVM::BitcastOp>(op, llResTy,
-                                                       adaptor.getAddr());
+    auto seqraUn = captureSeqraOpIdForLowering(op.getOperation());
+    auto bitcastOp = rewriter.replaceOpWithNewOp<mlir::LLVM::BitcastOp>(
+        op, llResTy, adaptor.getAddr());
+    attachSeqraOpId(bitcastOp.getOperation(), seqraUn, rewriter);
     return mlir::success();
   }
 }
@@ -3227,10 +3331,13 @@ mlir::LogicalResult CIRToLLVMGetRuntimeMemberOpLowering::matchAndRewrite(
     cir::GetRuntimeMemberOp op, OpAdaptor adaptor,
     mlir::ConversionPatternRewriter &rewriter) const {
   assert(lowerMod && "lowering module is not available");
+  mlir::Operation *cirOp = op.getOperation();
+  auto seqra = captureSeqraOpIdForLowering(cirOp);
   mlir::Type llvmResTy = getTypeConverter()->convertType(op.getType());
   mlir::Operation *llvmOp = lowerMod->getCXXABI().lowerGetRuntimeMember(
       op, llvmResTy, adaptor.getAddr(), adaptor.getMember(), rewriter);
   rewriter.replaceOp(op, llvmOp);
+  attachSeqraOpId(llvmOp, seqra, rewriter);
   return mlir::success();
 }
 
@@ -3311,8 +3418,11 @@ mlir::LogicalResult CIRToLLVMVTableAddrPointOpLowering::matchAndRewrite(
   }
 
   assert(eltType && "Shouldn't ever be missing an eltType here");
-  rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(op, targetType, eltType,
-                                                 symAddr, offsets, true);
+  auto seqraVT = captureSeqraOpIdForLowering(op.getOperation());
+  auto gepOp = rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
+      op, targetType, eltType, symAddr, offsets, true);
+
+  attachSeqraOpId(gepOp.getOperation(), seqraVT, rewriter);
 
   return mlir::success();
 }
@@ -3320,8 +3430,11 @@ mlir::LogicalResult CIRToLLVMVTableAddrPointOpLowering::matchAndRewrite(
 mlir::LogicalResult CIRToLLVMStackSaveOpLowering::matchAndRewrite(
     cir::StackSaveOp op, OpAdaptor adaptor,
     mlir::ConversionPatternRewriter &rewriter) const {
+  auto seqraStack = captureSeqraOpIdForLowering(op.getOperation());
   auto ptrTy = getTypeConverter()->convertType(op.getType());
-  rewriter.replaceOpWithNewOp<mlir::LLVM::StackSaveOp>(op, ptrTy);
+  auto stackSave = rewriter.replaceOpWithNewOp<mlir::LLVM::StackSaveOp>(
+      op, ptrTy);
+  attachSeqraOpId(stackSave.getOperation(), seqraStack, rewriter);
   return mlir::success();
 }
 
@@ -3401,12 +3514,16 @@ mlir::LogicalResult CIRToLLVMInlineAsmOpLowering::matchAndRewrite(
     opAttrs.push_back(newDict);
   }
 
-  rewriter.replaceOpWithNewOp<mlir::LLVM::InlineAsmOp>(
+  // Inline asm can return a pointer (e.g. `asm ("mov ..." : "=r"(p))`); when
+  // it does, propagate seqra so the alias bridge sees the asm-produced ptr.
+  auto seqraAsm = captureSeqraOpIdForLowering(op.getOperation());
+  auto asmOp = rewriter.replaceOpWithNewOp<mlir::LLVM::InlineAsmOp>(
       op, llResTy, llvmOperands, op.getAsmStringAttr(), op.getConstraintsAttr(),
       op.getSideEffectsAttr(),
       /*is_align_stack*/ mlir::UnitAttr(),
       mlir::LLVM::AsmDialectAttr::get(getContext(), llDialect),
       rewriter.getArrayAttr(opAttrs));
+  attachSeqraOpId(asmOp.getOperation(), seqraAsm, rewriter);
 
   return mlir::success();
 }
@@ -3657,9 +3774,13 @@ mlir::LogicalResult CIRToLLVMCatchParamOpLowering::matchAndRewrite(
     auto fnTy = mlir::LLVM::LLVMFunctionType::get(llvmPtrTy, {llvmPtrTy},
                                                   /*isVarArg=*/false);
     getOrCreateLLVMFuncOp(rewriter, op, fnName, fnTy);
-    rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
+    // The begin form yields a ptr to the caught exception object; mark it so
+    // the alias bridge can correlate it with the cir.catch_param origin.
+    auto seqra = captureSeqraOpIdForLowering(op.getOperation());
+    auto callOp = rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
         op, mlir::TypeRange{llvmPtrTy}, fnName,
         mlir::ValueRange{adaptor.getExceptionPtr()});
+    attachSeqraOpId(callOp.getOperation(), seqra, rewriter);
     return mlir::success();
   } else if (op.isEnd()) {
     StringRef fnName = "__cxa_end_catch";
@@ -3709,8 +3830,12 @@ mlir::LogicalResult CIRToLLVMAllocExceptionOpLowering::matchAndRewrite(
   getOrCreateLLVMFuncOp(rewriter, op, fnName, fnTy);
   auto size = rewriter.create<mlir::LLVM::ConstantOp>(op.getLoc(),
                                                       adaptor.getSizeAttr());
-  rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
+  // The exception slot pointer flows into stores/throws; treat it as a
+  // first-class allocation source for the alias bridge.
+  auto seqra = captureSeqraOpIdForLowering(op.getOperation());
+  auto callOp = rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
       op, mlir::TypeRange{llvmPtrTy}, fnName, mlir::ValueRange{size});
+  attachSeqraOpId(callOp.getOperation(), seqra, rewriter);
   return mlir::success();
 }
 
@@ -3809,10 +3934,14 @@ mlir::LogicalResult CIRToLLVMPtrMaskOpLowering::matchAndRewrite(
   mlir::Value masked =
       rewriter.create<mlir::LLVM::AndOp>(loc, intPtr, adaptor.getMask());
   mlir::Value diff = rewriter.create<mlir::LLVM::SubOp>(loc, intPtr, masked);
-  rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
+  // PtrMaskOp ties result to the input pointer (AllTypesMatch<ptr,result>);
+  // the resulting GEP is the materialized pointer in LLVM dialect.
+  auto seqra = captureSeqraOpIdForLowering(op.getOperation());
+  auto gep = rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
       op, getTypeConverter()->convertType(op.getType()),
       mlir::IntegerType::get(moduleOp->getContext(), 8), adaptor.getPtr(),
       diff);
+  attachSeqraOpId(gep.getOperation(), seqra, rewriter);
   return mlir::success();
 }
 
@@ -4360,6 +4489,12 @@ void ConvertCIRToLLVMPass::runOnOperation() {
   target.addLegalOp<mlir::LLVM::ZeroOp>();
 
   processCIRAttrs(module);
+
+  // When cir-tac runs ahead of lowering it stamps `cir.seqra.op_id` on each
+  // result-producing CIR op (aligned with serialized MLIROpID). Conversion
+  // patterns copy it onto the produced LLVM-dialect op via
+  // `captureSeqraOpIdForLowering`; LLVM translation emits `!seqra.op` metadata
+  // for the Sea-dsa bridge.
 
   llvm::SmallVector<mlir::Operation *> ops;
   ops.push_back(module);

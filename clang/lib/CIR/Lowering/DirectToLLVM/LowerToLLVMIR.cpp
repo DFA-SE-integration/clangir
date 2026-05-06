@@ -26,6 +26,11 @@ using namespace llvm;
 namespace cir {
 namespace direct {
 
+static constexpr llvm::StringLiteral seqraOpIdAttrName =
+    "cir.seqra.op_id";
+static constexpr llvm::StringLiteral seqraOpIdMetadataName =
+    "seqra.op";
+
 /// Implementation of the dialect interface that converts CIR attributes to LLVM
 /// IR metadata.
 class CIRDialectLLVMIRTranslationInterface
@@ -43,6 +48,8 @@ public:
       amendFunction(func, instructions, attribute, moduleTranslation);
     } else if (auto mod = dyn_cast<mlir::ModuleOp>(op)) {
       amendModule(mod, attribute, moduleTranslation);
+    } else if (attribute.getName() == seqraOpIdAttrName) {
+      amendSeqraOpId(op, instructions, moduleTranslation);
     }
     return mlir::success();
   }
@@ -260,6 +267,30 @@ private:
     if (shouldEmitArgName)
       llvmFunc->setMetadata("kernel_arg_name",
                             llvm::MDNode::get(vmCtx, argNames));
+  }
+
+  void amendSeqraOpId(mlir::Operation *op,
+                      llvm::ArrayRef<llvm::Instruction *> instructions,
+                      mlir::LLVM::ModuleTranslation &moduleTranslation) const {
+    if (instructions.empty()) {
+      return;
+    }
+
+    auto opIdAttr = op->getAttrOfType<mlir::IntegerAttr>(seqraOpIdAttrName);
+    if (!opIdAttr) {
+      return;
+    }
+
+    auto &llvmCtx = moduleTranslation.getLLVMContext();
+    llvm::Metadata *operands[] = {llvm::ConstantAsMetadata::get(
+        llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvmCtx),
+                               opIdAttr.getInt()))};
+    auto *metadataNode = llvm::MDNode::get(llvmCtx, operands);
+    for (llvm::Instruction *instruction : instructions) {
+      instruction->setMetadata(seqraOpIdMetadataName, metadataNode);
+    }
+
+    op->removeAttr(seqraOpIdAttrName);
   }
 };
 
